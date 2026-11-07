@@ -230,6 +230,31 @@ pub enum SoloistView {
     Setup,
 }
 
+/// A list that mixes local files with Spotify songs while Soloist plays.
+/// Soloist cannot play local files, and Spotify may refuse the built-in
+/// player the audio keys for its songs, so each run of songs plays on the
+/// player that can play it, and the next run starts when one ends.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SegmentPlan {
+    pub segments: Vec<Segment>,
+    pub index: usize,
+    /// Whether the current run was seen playing, so its end can be told
+    /// from the moment before it starts.
+    pub started: bool,
+    pub started_at: Instant,
+}
+
+/// Songs in a row that one player plays: local files on the built-in
+/// player, Spotify songs on Soloist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Segment {
+    pub local: bool,
+    pub uris: Vec<String>,
+}
+
+/// How long a run may take to start before the plan gives up on it.
+const SEGMENT_START_GRACE: Duration = Duration::from_secs(20);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Local,
@@ -777,6 +802,11 @@ pub struct App {
     pub local_files_revision: u64,
     /// Counts changes to `liked_local_files`.
     pub liked_local_revision: u64,
+    /// A list mixing local files with Spotify songs, played run by run on
+    /// the player that can play each: see `SegmentPlan`.
+    pub(crate) segment_plan: Option<SegmentPlan>,
+    /// The player the next `start_play` uses, set when a run of songs starts.
+    forced_play_target: Option<Target>,
     /// Liked Songs' rows with the liked local files among them, for the
     /// revisions of both lists that made it.
     pub liked_rows_with_local: Option<(u64, u64, std::sync::Arc<Vec<TableItem>>)>,
@@ -1455,6 +1485,8 @@ impl App {
             local_files: None,
             local_files_revision: 0,
             liked_local_revision: 0,
+            segment_plan: None,
+            forced_play_target: None,
             liked_rows_with_local: None,
             shuffle_wanted: session.shuffle_on,
             repeat_wanted: RepeatMode::from_api(&session.repeat),
@@ -4482,6 +4514,10 @@ impl App {
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
+        if self.segment_plan.is_some() {
+            self.advance_segments();
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
         self.poll_custom_themes(ctx);
         self.retry_soloist_when_due(ctx);
         if self.queued_play.is_some() && self.soloist_waiting() && !self.soloist_recovering() {
@@ -10570,6 +10606,16 @@ impl App {
             self.clear_play_pending();
             return;
         }
+        // A run of a mixed list names its player; any other play ends the list.
+        let forced = self.forced_play_target.take();
+        if forced.is_none() {
+            self.segment_plan = self.segment_plan_for(&request);
+            if self.segment_plan.is_some() {
+                self.start_segment();
+                return;
+            }
+        }
+        let shuffle_first = shuffle_first && forced.is_none();
         // Shuffle applies across contexts until disabled. A selected row still
         // starts first; otherwise choose a random starting track.
         let mut request = request;
@@ -10579,7 +10625,8 @@ impl App {
             self.shuffle_set_at = Some(Instant::now());
             self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
         }
-        let shuffle = shuffle_first || self.shuffle_wanted;
+        // A run plays in the list's order; shuffling it would lose the place.
+        let shuffle = forced.is_none() && (shuffle_first || self.shuffle_wanted);
         if request.offset_uri.is_none()
             && request.offset_position.is_none()
             && request.uris.is_empty()
@@ -10643,7 +10690,7 @@ impl App {
             shuffle: shuffle.then_some(true),
             at: Instant::now(),
         });
-        let target = self.play_target_for(&request);
+        let target = forced.unwrap_or_else(|| self.play_target_for(&request));
         self.queue_start_pending = Some(target.clone());
         // Held for Soloist, never handed to the built-in player meanwhile.
         if self.soloist_waiting() {
@@ -11990,16 +12037,20 @@ impl App {
     }
 
     /// Where `request` plays. Soloist cannot play local files, so with
-    /// Soloist on, anything that holds a song from the local files folder
-    /// plays on the built-in player, which can, Spotify songs around it
-    /// included. Anything else goes back to Soloist once the built-in
-    /// player took over for local files.
+    /// Soloist on, a list of only local files plays on the built-in player.
+    /// Spotify may refuse that player the audio keys for its own songs, so
+    /// anything else goes to Soloist, back from the built-in player too; a
+    /// list mixing both plays run by run (`SegmentPlan`).
     pub(crate) fn play_target_for(&self, request: &PlayRequest) -> Target {
         let target = self.target();
         if !self.settings.soloist_enabled || !self.local_ready {
             return target;
         }
-        let local = self.request_holds_local_files(request);
+        let local = !request.uris.is_empty()
+            && request
+                .uris
+                .iter()
+                .all(|uri| self.local_file(uri).is_some());
         match target {
             Target::Remote(_) if local => Target::Local,
             Target::Local if !local && !self.soloist_waiting() => {
@@ -12009,32 +12060,180 @@ impl App {
         }
     }
 
-    /// Whether `request` plays a song the local files folder holds: one of
-    /// its listed songs, or a loaded row of the playlist it starts.
-    pub(crate) fn request_holds_local_files(&self, request: &PlayRequest) -> bool {
-        if request
-            .uris
-            .iter()
-            .any(|uri| self.local_file(uri).is_some())
-        {
-            return true;
+    /// The songs `request` plays from its starting one: its list, or the
+    /// loaded rows of the playlist it starts.
+    fn requested_songs(&self, request: &PlayRequest) -> Vec<String> {
+        if !request.uris.is_empty() {
+            let start = request
+                .offset_position
+                .map(|position| position as usize)
+                .or_else(|| {
+                    let offset = request.offset_uri.as_ref()?;
+                    request.uris.iter().position(|uri| uri == offset)
+                })
+                .unwrap_or(0)
+                .min(request.uris.len());
+            return request.uris[start..].to_vec();
         }
-        let Some(id) = request
+        let Some(page) = request
             .context_uri
             .as_deref()
             .and_then(|context| context.strip_prefix("spotify:playlist:"))
+            .and_then(|id| self.playlist_pages.get(id))
         else {
-            return false;
+            return Vec::new();
         };
-        self.playlist_pages.get(id).is_some_and(|page| {
-            page.items
-                .items
-                .iter()
-                .chain(page.items.windows.values().flatten())
-                .filter(|row| row.is_local)
-                .filter_map(|row| row.item.as_ref().or(row.track.as_ref()))
-                .any(|item| self.local_file(item.uri()).is_some())
+        let rows: Vec<String> = page
+            .items
+            .items
+            .iter()
+            .map(|row| {
+                row.item
+                    .as_ref()
+                    .or(row.track.as_ref())
+                    .map(|item| item.uri().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let start = request
+            .offset_position
+            .and_then(|position| position.checked_sub(page.items.base_offset))
+            .map(|position| position as usize)
+            .or_else(|| {
+                let offset = request.offset_uri.as_ref()?;
+                rows.iter().position(|uri| uri == offset)
+            })
+            .unwrap_or(0)
+            .min(rows.len());
+        rows[start..].to_vec()
+    }
+
+    /// The runs of a list that mixes local files the folder holds with
+    /// Spotify songs, while Soloist plays: None for any other list. Local
+    /// files the folder lacks are left out, as a sorted view leaves them.
+    pub(crate) fn segment_plan_for(&self, request: &PlayRequest) -> Option<SegmentPlan> {
+        if !self.settings.soloist_enabled || !self.local_ready || self.soloist_waiting() {
+            return None;
+        }
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut count = 0;
+        for uri in self.requested_songs(request) {
+            if count == MAX_PLAYED_URIS {
+                break;
+            }
+            let local = uri.starts_with(LOCAL_URI_PREFIX);
+            if uri.is_empty() || (local && self.local_file(&uri).is_none()) {
+                continue;
+            }
+            count += 1;
+            match segments.last_mut() {
+                Some(segment) if segment.local == local => segment.uris.push(uri),
+                _ => segments.push(Segment {
+                    local,
+                    uris: vec![uri],
+                }),
+            }
+        }
+        (segments.len() > 1 && segments.iter().any(|segment| segment.local)).then(|| SegmentPlan {
+            segments,
+            index: 0,
+            started: false,
+            started_at: Instant::now(),
         })
+    }
+
+    /// Starts the plan's current run on its player.
+    fn start_segment(&mut self) {
+        let Some(plan) = self.segment_plan.as_mut() else {
+            return;
+        };
+        let Some(segment) = plan.segments.get(plan.index).cloned() else {
+            self.segment_plan = None;
+            return;
+        };
+        plan.started = false;
+        plan.started_at = Instant::now();
+        self.forced_play_target = Some(if segment.local {
+            Target::Local
+        } else {
+            Target::Remote(self.soloist_device_id.clone())
+        });
+        self.start_play(PlayRequest::tracks(segment.uris), false);
+    }
+
+    /// What the current run's player is doing: the song, whether it plays,
+    /// and whether it has come to the end of its list. None while that
+    /// player says nothing.
+    fn segment_player_state(&self, local: bool) -> Option<(String, bool, bool)> {
+        if local {
+            let uri = self
+                .local
+                .track
+                .as_ref()
+                .map(|track| track.uri.clone())
+                .unwrap_or_default();
+            let playing = matches!(
+                self.local.playback,
+                crate::player::Playback::Playing | crate::player::Playback::Loading
+            );
+            let stopped = self.local.playback == crate::player::Playback::Stopped;
+            return Some((uri, playing, stopped));
+        }
+        let remote = self.remote_fresh()?;
+        let device = remote.state.device.as_ref()?.id.as_deref()?;
+        if Some(device) != self.soloist_device_id.as_deref() {
+            return None;
+        }
+        let item = remote.state.item.as_ref()?;
+        let duration = item.duration_ms();
+        let progress = remote.state.progress_ms.unwrap_or(0);
+        let at_rest = progress == 0 || (duration > 0 && progress + 2_500 >= duration);
+        Some((
+            item.uri().to_string(),
+            remote.state.is_playing,
+            !remote.state.is_playing && at_rest,
+        ))
+    }
+
+    /// Moves a mixed list on to its next run when the current one ends.
+    fn advance_segments(&mut self) {
+        let Some(plan) = self.segment_plan.as_ref() else {
+            return;
+        };
+        let segment = plan.segments[plan.index].clone();
+        let Some((uri, playing, ended)) = self.segment_player_state(segment.local) else {
+            if !segment.local {
+                self.poll_remote_soon();
+            }
+            return;
+        };
+        let inside = segment.uris.contains(&uri);
+        let plan = self.segment_plan.as_mut().expect("checked above");
+        if !plan.started {
+            if inside && playing {
+                plan.started = true;
+            } else if plan.started_at.elapsed() > SEGMENT_START_GRACE {
+                log::warn!(
+                    "A run of local files and Spotify songs did not start; the list stops here"
+                );
+                self.segment_plan = None;
+            }
+            return;
+        }
+        let last = segment.uris.last().is_some_and(|last| *last == uri);
+        // Moved past the run (an autoplayed song), or stopped at its end.
+        if !(!inside && !uri.is_empty() || (ended && (last || uri.is_empty()))) {
+            if !segment.local && last {
+                self.poll_remote_soon();
+            }
+            return;
+        }
+        plan.index += 1;
+        if plan.index < plan.segments.len() {
+            self.start_segment();
+        } else {
+            self.segment_plan = None;
+        }
     }
 
     /// The local files liked on this computer, newest first, with when.
@@ -23961,31 +24160,56 @@ mod tests {
     const LOCAL_SONG: &str = "spotify:local:Artist:Album:Song:200";
 
     #[test]
-    fn with_soloist_a_list_holding_a_local_file_plays_on_the_built_in_player() {
+    fn with_soloist_only_local_files_play_on_the_built_in_player() {
         let mut app = soloist_with_local_files(&[LOCAL_SONG]);
-        let local = PlayRequest::tracks(vec!["spotify:track:a".into(), LOCAL_SONG.into()]);
+        let local = PlayRequest::tracks(vec![LOCAL_SONG.into()]);
         assert_eq!(app.play_target_for(&local), Target::Local);
+        assert_eq!(app.segment_plan_for(&local), None);
         let spotify = PlayRequest::tracks(vec!["spotify:track:a".into()]);
         assert_eq!(
             app.play_target_for(&spotify),
             Target::Remote(Some("soloist".into()))
         );
+        assert_eq!(app.segment_plan_for(&spotify), None);
         app.backend.shutdown();
     }
 
     #[test]
-    fn with_soloist_a_local_file_the_folder_lacks_stays_on_soloist() {
-        let mut app = soloist_with_local_files(&[]);
-        let request = PlayRequest::tracks(vec![LOCAL_SONG.into()]);
+    fn with_soloist_a_mixed_list_plays_in_runs_from_its_starting_song() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        let missing = "spotify:local:Gone:Gone:Gone:100";
+        let request = PlayRequest::tracks(vec![
+            "spotify:track:before".into(),
+            "spotify:track:a".into(),
+            missing.into(),
+            LOCAL_SONG.into(),
+            "spotify:track:b".into(),
+            "spotify:track:c".into(),
+        ])
+        .starting_at_index(1);
+        let plan = app.segment_plan_for(&request).unwrap();
         assert_eq!(
-            app.play_target_for(&request),
-            Target::Remote(Some("soloist".into()))
+            plan.segments,
+            [
+                Segment {
+                    local: false,
+                    uris: vec!["spotify:track:a".into()]
+                },
+                Segment {
+                    local: true,
+                    uris: vec![LOCAL_SONG.into()]
+                },
+                Segment {
+                    local: false,
+                    uris: vec!["spotify:track:b".into(), "spotify:track:c".into()]
+                },
+            ]
         );
         app.backend.shutdown();
     }
 
     #[test]
-    fn with_soloist_a_playlist_with_a_local_row_plays_on_the_built_in_player() {
+    fn with_soloist_a_playlist_with_a_local_row_plays_in_runs() {
         let mut app = soloist_with_local_files(&[LOCAL_SONG]);
         let mut items = PagedList::default();
         let mut local = cached_playlist_row(LOCAL_SONG);
@@ -23999,28 +24223,93 @@ mod tests {
             },
         );
         let mixed = PlayRequest::context("spotify:playlist:mixed");
-        assert_eq!(app.play_target_for(&mixed), Target::Local);
-        let other = PlayRequest::context("spotify:playlist:other");
+        assert_eq!(app.segment_plan_for(&mixed).unwrap().segments.len(), 2);
+        let from_local = PlayRequest::context("spotify:playlist:mixed").starting_at_uri(LOCAL_SONG);
         assert_eq!(
-            app.play_target_for(&other),
-            Target::Remote(Some("soloist".into()))
+            app.segment_plan_for(&from_local),
+            None,
+            "only local files are left"
         );
         app.backend.shutdown();
     }
 
     #[test]
-    fn after_local_files_the_next_spotify_play_returns_to_soloist() {
+    fn a_run_moves_on_when_its_player_comes_to_the_end() {
         let mut app = soloist_with_local_files(&[LOCAL_SONG]);
-        app.local.track = Some(crate::player::LocalTrack::default());
-        app.local.playback = crate::player::Playback::Playing;
-        assert_eq!(app.target(), Target::Local);
-        let spotify = PlayRequest::tracks(vec!["spotify:track:a".into()]);
-        assert_eq!(
-            app.play_target_for(&spotify),
-            Target::Remote(Some("soloist".into()))
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::PlayUris {
+                uris: vec![LOCAL_SONG.into(), "spotify:track:b".into()],
+                index: 0,
+            },
+            &ctx,
         );
-        let local = PlayRequest::tracks(vec![LOCAL_SONG.into()]);
-        assert_eq!(app.play_target_for(&local), Target::Local);
+        let plan = app.segment_plan.clone().unwrap();
+        assert_eq!(plan.index, 0);
+        assert!(plan.segments[0].local);
+        // The built-in player plays the local file, then stops at its end.
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: LOCAL_SONG.into(),
+            ..Default::default()
+        });
+        app.local.playback = crate::player::Playback::Playing;
+        app.advance_segments();
+        assert!(app.segment_plan.as_ref().unwrap().started);
+        app.local.playback = crate::player::Playback::Stopped;
+        app.advance_segments();
+        let plan = app.segment_plan.clone().unwrap();
+        assert_eq!(plan.index, 1, "Soloist's run starts next");
+        assert!(!plan.started);
+        // Soloist plays the last song and stops at its end: the list is done.
+        let state = |playing: bool, progress: u32| PlaybackState {
+            is_playing: playing,
+            progress_ms: Some(progress),
+            device: Some(Device {
+                id: Some("soloist".into()),
+                ..Default::default()
+            }),
+            item: Some(PlayableItem::Track(Track {
+                uri: "spotify:track:b".into(),
+                duration_ms: 100_000,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        app.remote = Some(RemoteSnapshot {
+            state: state(true, 1_000),
+            received_at: Instant::now(),
+        });
+        app.advance_segments();
+        assert!(app.segment_plan.as_ref().unwrap().started);
+        app.remote = Some(RemoteSnapshot {
+            state: state(false, 0),
+            received_at: Instant::now(),
+        });
+        app.advance_segments();
+        assert_eq!(app.segment_plan, None);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn another_play_ends_a_mixed_list() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::PlayUris {
+                uris: vec![LOCAL_SONG.into(), "spotify:track:b".into()],
+                index: 0,
+            },
+            &ctx,
+        );
+        assert!(app.segment_plan.is_some());
+        app.apply(
+            Action::PlayUris {
+                uris: vec!["spotify:track:x".into()],
+                index: 0,
+            },
+            &ctx,
+        );
+        assert_eq!(app.segment_plan, None);
         app.backend.shutdown();
     }
 

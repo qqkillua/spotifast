@@ -196,10 +196,11 @@ Spotifast removes the link, and the input is silent until it has gone.
 Linux without PipeWire keeps Soloist's direct output, without EQ or visualizers.
 The Mac and Windows routes are described below. Full queue editing still
 requires the built-in player on every platform. Soloist cannot play local
-files, so a playlist or list that holds a song from the local files folder,
-including the **Local files** page, plays on the built-in player, Spotify
-songs around it included; the next play without local files returns to
-Soloist.
+files, and Spotify may refuse the built-in player the audio keys for its own
+songs. So a list of only local files, such as the **Local files** page, plays
+on the built-in player, and a list mixing both plays run by run: Spotify songs
+on Soloist, local files on the built-in player, each run starting when the
+one before it ends. Any other play ends such a list.
 The Soloist API itself provides no PCM stream. OS audio processing does not
 establish which Spotify format was delivered, and is not advertised as
 bit-perfect or as a DRM workaround.
