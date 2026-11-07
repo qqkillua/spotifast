@@ -1848,6 +1848,14 @@ pub struct CachedRootlist {
     pub entries: Vec<crate::player::RootlistEntry>,
 }
 
+/// A local file liked on this computer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LikedLocalFile {
+    pub uri: String,
+    /// When it was liked, as Spotify writes a song's `added_at`.
+    pub added_at: String,
+}
+
 /// Restorable UI session: what was open when the app last closed.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1879,6 +1887,11 @@ pub struct SessionState {
     pub last_queue_rows: Vec<crate::api::models::PlayableItem>,
     /// Sidebar folders rolled up, by their rootlist ids.
     pub collapsed_folders: Vec<String>,
+    /// Local files liked on this computer, newest first. Spotify refuses a
+    /// `spotify:local:` URI in Liked Songs, so they are kept here and shown
+    /// among the songs Spotify keeps, by the time they were liked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub liked_local_files: Vec<LikedLocalFile>,
     /// Last good playlist tree, scoped to the account that supplied it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rootlist: Option<CachedRootlist>,

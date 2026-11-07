@@ -2599,6 +2599,8 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
             let rows = app.library.liked.items.iter().map(liked_row).collect();
             remember_table_items(app, Page::LikedSongs, revision, revision, names, rows)
         };
+    let local_liked = app.liked_local_files.len() as u32;
+    let items = with_liked_local_files(app, items, revision);
     if items.is_empty() && !app.network_reachable {
         widgets::empty_state(
             ui,
@@ -2612,7 +2614,11 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
         );
         return;
     }
-    let total = app.library.liked.total.unwrap_or(items.len() as u32);
+    let total = app
+        .library
+        .liked
+        .total
+        .map_or(items.len() as u32, |total| total + local_liked);
     let user = app
         .user
         .as_ref()
@@ -2662,7 +2668,18 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
         },
         app.library.liked.revision,
     );
-    let liked_view = table_view.view_uris.as_ref().map(Arc::clone);
+    let all_uris: Arc<[String]> = items
+        .iter()
+        .map(|(item, _, _)| item.uri().to_string())
+        .collect::<Vec<_>>()
+        .into();
+    // Spotify's Liked Songs holds no local file, so with one liked here the
+    // page plays its own rows, as a sorted view does.
+    let liked_view = table_view
+        .view_uris
+        .as_ref()
+        .map(Arc::clone)
+        .or_else(|| (local_liked > 0).then(|| Arc::clone(&all_uris)));
     let actions = Actions {
         play_uri: collection_uri.clone(),
         view: liked_view,
@@ -2681,12 +2698,8 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
         actions_row(app, ui, actions, Some(&mut filter));
     }
     ui.data_mut(|data| data.insert_temp(filter_id, filter.clone()));
-    let uris: Arc<[String]> = items
-        .iter()
-        .map(|(item, _, _)| item.uri().to_string())
-        .collect::<Vec<_>>()
-        .into();
-    let context = match collection_uri {
+    let uris = all_uris;
+    let context = match collection_uri.filter(|_| local_liked == 0) {
         Some(uri) => RowContext::Context {
             uri,
             editable_playlist: None,
@@ -2719,6 +2732,47 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
             plays_shown_rows: false,
         },
     );
+}
+
+/// Liked Songs' rows with the local files liked on this computer among
+/// them, each where the time it was liked puts it. Spotify keeps the rest
+/// newest first, and refuses local files in Liked Songs.
+fn with_liked_local_files(
+    app: &mut App,
+    items: Arc<Vec<TableItem>>,
+    revision: u64,
+) -> Arc<Vec<TableItem>> {
+    if app.liked_local_files.is_empty() {
+        return items;
+    }
+    let local_revision = app.liked_local_revision;
+    if let Some((base, local, merged)) = &app.liked_rows_with_local
+        && *base == revision
+        && *local == local_revision
+    {
+        return Arc::clone(merged);
+    }
+    let mut merged: Vec<TableItem> = Vec::with_capacity(items.len() + app.liked_local_files.len());
+    let mut rest = items.iter().peekable();
+    for (track, added_at) in app.liked_local_tracks() {
+        while let Some(row) = rest.peek() {
+            // A row with no date, or one liked later, comes first.
+            if row
+                .1
+                .as_deref()
+                .is_some_and(|row_added| row_added < added_at.as_str())
+            {
+                break;
+            }
+            merged.push((*row).clone());
+            rest.next();
+        }
+        merged.push((PlayableItem::Track(track), Some(added_at), None));
+    }
+    merged.extend(rest.cloned());
+    let merged = Arc::new(merged);
+    app.liked_rows_with_local = Some((revision, local_revision, Arc::clone(&merged)));
+    merged
 }
 
 /// `1,234 songs` in a playlist, album or Liked Songs byline.
@@ -4964,6 +5018,44 @@ mod tests {
             table.app.actions.as_slice(),
             [Action::PlayFromRow { index: 25, .. }]
         ));
+    }
+
+    #[test]
+    fn liked_local_files_sit_among_liked_songs_by_when_they_were_liked() {
+        let mut app = test_app();
+        let row = |uri: &str, added: &str| -> TableItem {
+            (
+                PlayableItem::Track(Track {
+                    uri: uri.into(),
+                    ..Default::default()
+                }),
+                Some(added.into()),
+                None,
+            )
+        };
+        let spotify = Arc::new(vec![
+            row("spotify:track:new", "2026-11-07T10:00:00Z"),
+            row("spotify:track:old", "2026-01-01T10:00:00Z"),
+        ]);
+        app.liked_local_files = vec![crate::settings::LikedLocalFile {
+            uri: "spotify:local:Artist:Album:Song:200".into(),
+            added_at: "2026-06-01T10:00:00Z".into(),
+        }];
+        let merged = with_liked_local_files(&mut app, Arc::clone(&spotify), 1);
+        let uris: Vec<_> = merged.iter().map(|(item, _, _)| item.uri()).collect();
+        assert_eq!(
+            uris,
+            [
+                "spotify:track:new",
+                "spotify:local:Artist:Album:Song:200",
+                "spotify:track:old"
+            ]
+        );
+        app.liked_local_files.clear();
+        assert_eq!(
+            with_liked_local_files(&mut app, Arc::clone(&spotify), 2).len(),
+            2
+        );
     }
 
     #[test]

@@ -775,6 +775,11 @@ pub struct App {
     /// Counts the scans of the local files folder, so the Local files page
     /// rebuilds its rows after one.
     pub local_files_revision: u64,
+    /// Counts changes to `liked_local_files`.
+    pub liked_local_revision: u64,
+    /// Liked Songs' rows with the liked local files among them, for the
+    /// revisions of both lists that made it.
+    pub liked_rows_with_local: Option<(u64, u64, std::sync::Arc<Vec<TableItem>>)>,
     /// Requested shuffle mode, applied to every context until changed.
     shuffle_wanted: bool,
     /// The repeat mode saved by the last run, which the first local load
@@ -900,6 +905,9 @@ pub struct App {
     pending_pastes: Vec<PendingPaste>,
     /// Sidebar folders rolled up, by their rootlist ids.
     pub collapsed_folders: Vec<String>,
+    /// Local files liked on this computer, newest first: see
+    /// `SessionState::liked_local_files`.
+    pub liked_local_files: Vec<crate::settings::LikedLocalFile>,
     /// A newer release than this build, once GitHub has said so.
     pub update: Option<crate::updates::Release>,
     last_update_check: Option<Instant>,
@@ -1446,6 +1454,8 @@ impl App {
             played_row: None,
             local_files: None,
             local_files_revision: 0,
+            liked_local_revision: 0,
+            liked_rows_with_local: None,
             shuffle_wanted: session.shuffle_on,
             repeat_wanted: RepeatMode::from_api(&session.repeat),
             shuffle_set_at: None,
@@ -1507,6 +1517,7 @@ impl App {
             copied_songs: Vec::new(),
             pending_pastes: Vec::new(),
             collapsed_folders: session.collapsed_folders.clone(),
+            liked_local_files: session.liked_local_files.clone(),
             update: None,
             last_update_check: None,
             update_checking: false,
@@ -1850,6 +1861,10 @@ impl App {
     }
 
     pub fn is_saved(&self, uri: &str) -> Option<bool> {
+        if uri.starts_with(LOCAL_URI_PREFIX) {
+            let key = local_file_key(uri);
+            return Some(self.liked_local_files.iter().any(|liked| liked.uri == key));
+        }
         let exact = self.saved.get(uri).copied();
         if exact == Some(true)
             || self
@@ -12022,6 +12037,14 @@ impl App {
         })
     }
 
+    /// The local files liked on this computer, newest first, with when.
+    pub fn liked_local_tracks(&self) -> Vec<(Track, String)> {
+        self.liked_local_files
+            .iter()
+            .filter_map(|liked| Some((local_uri_track(&liked.uri)?, liked.added_at.clone())))
+            .collect()
+    }
+
     /// The songs in the local files folder, ordered by artist, album and
     /// title, described by what their URIs say of them.
     pub fn local_file_tracks(&self) -> Vec<Track> {
@@ -12030,13 +12053,7 @@ impl App {
         };
         let mut tracks: Vec<Track> = files
             .keys()
-            .filter_map(|uri| {
-                let id = librespot_core::SpotifyUri::from_uri(uri).ok()?;
-                match crate::session_reads::local_track(&id, uri.clone())? {
-                    PlayableItem::Track(track) => Some(track),
-                    _ => None,
-                }
-            })
+            .filter_map(|uri| local_uri_track(uri))
             .collect();
         let key = |track: &Track| {
             (
@@ -12421,7 +12438,38 @@ impl App {
         }
     }
 
+    /// Likes or unlikes a local file on this computer only.
+    fn set_local_file_liked(&mut self, uri: &str, liked: bool) {
+        let key = local_file_key(uri);
+        if key.is_empty() {
+            return;
+        }
+        self.liked_local_files.retain(|held| held.uri != key);
+        if liked {
+            self.liked_local_files.insert(
+                0,
+                crate::settings::LikedLocalFile {
+                    uri: key,
+                    added_at: jiff::Timestamp::now()
+                        .strftime("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string(),
+                },
+            );
+        }
+        self.liked_local_revision = self.liked_local_revision.wrapping_add(1);
+        self.session_dirty = true;
+    }
+
     fn set_saved(&mut self, uri: String, saved: bool) {
+        if uri.starts_with(LOCAL_URI_PREFIX) {
+            self.set_local_file_liked(&uri, saved);
+            self.toast(if saved {
+                gettext(self.locale, "Added to Liked Songs")
+            } else {
+                gettext(self.locale, "Removed from Liked Songs")
+            });
+            return;
+        }
         if uri.starts_with("spotify:playlist:") {
             self.saved.insert(uri.clone(), saved);
             let id = util::uri_id(&uri).unwrap_or_default().to_string();
@@ -12921,8 +12969,25 @@ impl App {
                     self.resync_local_queue();
                 }
             }
-            Action::SetSavedMany { uris, saved } => {
+            Action::SetSavedMany { mut uris, saved } => {
                 let mut changed_tracks = false;
+                // Spotify refuses local files; they are liked here instead.
+                let before = uris.len();
+                uris.retain(|uri| {
+                    if uri.starts_with(LOCAL_URI_PREFIX) {
+                        self.set_local_file_liked(uri, saved);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if uris.is_empty() && before > 0 {
+                    self.toast(if saved {
+                        gettext(self.locale, "Added to Liked Songs")
+                    } else {
+                        gettext(self.locale, "Removed from Liked Songs")
+                    });
+                }
                 for uri in &uris {
                     self.set_saved_state(uri.clone(), saved);
                     self.saved_writes.insert(uri.clone(), saved);
@@ -14989,6 +15054,7 @@ impl App {
                 last_track: self.resume_track.clone(),
                 last_position_ms: self.resume_position_ms,
                 collapsed_folders: self.collapsed_folders.clone(),
+                liked_local_files: self.liked_local_files.clone(),
                 rootlist: self.rootlist_cache.clone(),
                 last_added_queue: if self.resume_queue.is_empty() {
                     self.manual_queue.clone()
@@ -15249,6 +15315,15 @@ fn engine_queues(uri: &str) -> bool {
 
 /// A `spotify:local:` URI as the player keys it, parsed and written back as
 /// librespot does; empty for any other URI.
+/// A local file as a track, from what its URI says of it.
+fn local_uri_track(uri: &str) -> Option<Track> {
+    let id = librespot_core::SpotifyUri::from_uri(uri).ok()?;
+    match crate::session_reads::local_track(&id, uri.to_string())? {
+        PlayableItem::Track(track) => Some(track),
+        _ => None,
+    }
+}
+
 pub(crate) fn local_file_key(uri: &str) -> String {
     if !uri.starts_with(LOCAL_URI_PREFIX) {
         return String::new();
@@ -23972,6 +24047,33 @@ mod tests {
             Page::decode(&Page::LocalFiles.encode()),
             Some(Page::LocalFiles)
         );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_liked_local_file_is_kept_here_and_survives_a_restart() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        let ctx = egui::Context::default();
+        app.apply(Action::ToggleSaved(LOCAL_SONG.into()), &ctx);
+        assert_eq!(app.is_saved(LOCAL_SONG), Some(true));
+        assert_eq!(app.liked_local_files[0].uri, local_file_key(LOCAL_SONG));
+        let tracks = app.liked_local_tracks();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].0.name, "Song");
+        assert!(tracks[0].1.ends_with('Z'));
+        app.save_session();
+        app.flush_files();
+        let session = SessionState::load(&app.dirs.session_file());
+        assert_eq!(session.liked_local_files, app.liked_local_files);
+        app.apply(
+            Action::SetSavedMany {
+                uris: vec![LOCAL_SONG.into()],
+                saved: false,
+            },
+            &ctx,
+        );
+        assert_eq!(app.is_saved(LOCAL_SONG), Some(false));
+        assert!(app.liked_local_files.is_empty());
         app.backend.shutdown();
     }
 
