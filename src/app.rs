@@ -10691,6 +10691,9 @@ impl App {
             at: Instant::now(),
         });
         let target = forced.unwrap_or_else(|| self.play_target_for(&request));
+        if self.settings.soloist_enabled {
+            self.silence_other_player(&target);
+        }
         if self.settings.soloist_enabled && matches!(target, Target::Remote(_)) {
             request = Self::without_local_files(request);
             if request.uris.is_empty() && request.context_uri.is_none() {
@@ -12079,6 +12082,37 @@ impl App {
                 .track
                 .as_ref()
                 .is_some_and(|track| track.uri.starts_with(LOCAL_URI_PREFIX))
+    }
+
+    /// With Soloist on, two players live on this computer, and Spotify does
+    /// not always stop one when the other starts: what starts on one pauses
+    /// the other, so two songs never play at once.
+    fn silence_other_player(&mut self, target: &Target) {
+        match target {
+            Target::Local => {
+                let soloist_playing = self.remote.as_ref().is_some_and(|remote| {
+                    remote.state.is_playing
+                        && remote
+                            .state
+                            .device
+                            .as_ref()
+                            .and_then(|device| device.id.as_deref())
+                            == self.soloist_device_id.as_deref()
+                });
+                if soloist_playing && self.soloist_device_id.is_some() {
+                    self.remote(RemoteAction::Pause, self.soloist_device_id.clone());
+                }
+            }
+            Target::Remote(_) => {
+                if matches!(
+                    self.local.playback,
+                    crate::player::Playback::Playing | crate::player::Playback::Loading
+                ) {
+                    self.backend.player(PlayerCommand::Toggle);
+                    self.local.playback = crate::player::Playback::Paused;
+                }
+            }
+        }
     }
 
     /// `request` without the local files in its list, for Soloist, which
@@ -24386,6 +24420,25 @@ mod tests {
         assert_eq!(app.target(), Target::Remote(Some("soloist".into())));
         app.local.track.as_mut().unwrap().uri = LOCAL_SONG.into();
         assert_eq!(app.target(), Target::Local);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn starting_on_soloist_pauses_the_built_in_player() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: LOCAL_SONG.into(),
+            ..Default::default()
+        });
+        app.local.playback = crate::player::Playback::Playing;
+        app.apply(
+            Action::PlayUris {
+                uris: vec!["spotify:track:x".into()],
+                index: 0,
+            },
+            &egui::Context::default(),
+        );
+        assert_eq!(app.local.playback, crate::player::Playback::Paused);
         app.backend.shutdown();
     }
 
