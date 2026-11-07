@@ -1990,7 +1990,7 @@ impl App {
 
     /// Where playback commands go: this computer's player or a remote device.
     pub fn target(&self) -> Target {
-        if self.local_ready && self.local.is_active() {
+        if self.local_ready && self.local.is_active() && !self.builtin_yields_to_soloist() {
             return Target::Local;
         }
         if let Some(selected) = &self.selected_device
@@ -10691,6 +10691,13 @@ impl App {
             at: Instant::now(),
         });
         let target = forced.unwrap_or_else(|| self.play_target_for(&request));
+        if self.settings.soloist_enabled && matches!(target, Target::Remote(_)) {
+            request = Self::without_local_files(request);
+            if request.uris.is_empty() && request.context_uri.is_none() {
+                self.clear_play_pending();
+                return;
+            }
+        }
         self.queue_start_pending = Some(target.clone());
         // Held for Soloist, never handed to the built-in player meanwhile.
         if self.soloist_waiting() {
@@ -12058,6 +12065,60 @@ impl App {
             }
             target => target,
         }
+    }
+
+    /// With Soloist ready, the built-in player only plays local files: Spotify
+    /// may refuse it the audio keys for its own songs. One that holds a
+    /// Spotify song, such as a session restored at start, leaves the
+    /// controls to Soloist.
+    fn builtin_yields_to_soloist(&self) -> bool {
+        self.settings.soloist_enabled
+            && !self.soloist_waiting()
+            && !self
+                .local
+                .track
+                .as_ref()
+                .is_some_and(|track| track.uri.starts_with(LOCAL_URI_PREFIX))
+    }
+
+    /// `request` without the local files in its list, for Soloist, which
+    /// refuses the whole list over one: the start moves to the next song.
+    fn without_local_files(mut request: PlayRequest) -> PlayRequest {
+        if !request
+            .uris
+            .iter()
+            .any(|uri| uri.starts_with(LOCAL_URI_PREFIX))
+        {
+            return request;
+        }
+        let start = request
+            .offset_position
+            .map(|position| position as usize)
+            .or_else(|| {
+                let offset = request.offset_uri.as_ref()?;
+                request.uris.iter().position(|uri| uri == offset)
+            });
+        let before = start.map(|start| {
+            request.uris[..start.min(request.uris.len())]
+                .iter()
+                .filter(|uri| !uri.starts_with(LOCAL_URI_PREFIX))
+                .count() as u32
+        });
+        request
+            .uris
+            .retain(|uri| !uri.starts_with(LOCAL_URI_PREFIX));
+        if request
+            .offset_uri
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with(LOCAL_URI_PREFIX))
+        {
+            request.offset_uri = None;
+        }
+        if request.offset_uri.is_none() {
+            request.offset_position =
+                before.filter(|position| (*position as usize) < request.uris.len());
+        }
+        request
     }
 
     /// The songs `request` plays from its starting one: its list, or the
@@ -24287,6 +24348,44 @@ mod tests {
         });
         app.advance_segments();
         assert_eq!(app.segment_plan, None);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn soloist_gets_a_list_without_its_local_files() {
+        let request = PlayRequest::tracks(vec![
+            "spotify:track:a".into(),
+            LOCAL_SONG.into(),
+            "spotify:track:b".into(),
+            "spotify:track:c".into(),
+        ])
+        .starting_at_index(2);
+        let request = App::without_local_files(request);
+        assert_eq!(
+            request.uris,
+            ["spotify:track:a", "spotify:track:b", "spotify:track:c"]
+        );
+        assert_eq!(request.offset_position, Some(1), "still starts at b");
+        let from_local = App::without_local_files(
+            PlayRequest::tracks(vec![LOCAL_SONG.into(), "spotify:track:b".into()])
+                .starting_at_uri(LOCAL_SONG),
+        );
+        assert_eq!(from_local.uris, ["spotify:track:b"]);
+        assert_eq!(from_local.offset_uri, None);
+        assert_eq!(from_local.offset_position, Some(0));
+    }
+
+    #[test]
+    fn a_built_in_player_holding_a_spotify_song_leaves_the_controls_to_soloist() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:restored".into(),
+            ..Default::default()
+        });
+        app.local.playback = crate::player::Playback::Paused;
+        assert_eq!(app.target(), Target::Remote(Some("soloist".into())));
+        app.local.track.as_mut().unwrap().uri = LOCAL_SONG.into();
+        assert_eq!(app.target(), Target::Local);
         app.backend.shutdown();
     }
 
