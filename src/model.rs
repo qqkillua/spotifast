@@ -114,6 +114,9 @@ pub enum Page {
     NewReleases,
     Search,
     LikedSongs,
+    /// The songs in the local files folder, which Spotify keeps in no
+    /// playlist that can be played.
+    LocalFiles,
     Albums,
     Artists,
     Podcasts,
@@ -137,6 +140,7 @@ impl Page {
             Page::NewReleases => "new-releases".into(),
             Page::Search => "search".into(),
             Page::LikedSongs => "liked".into(),
+            Page::LocalFiles => "local-files".into(),
             Page::Albums => "albums".into(),
             Page::Artists => "artists".into(),
             Page::Podcasts => "podcasts".into(),
@@ -158,6 +162,7 @@ impl Page {
             "new-releases" => Page::NewReleases,
             "search" => Page::Search,
             "liked" => Page::LikedSongs,
+            "local-files" => Page::LocalFiles,
             "albums" => Page::Albums,
             "artists" => Page::Artists,
             "podcasts" => Page::Podcasts,

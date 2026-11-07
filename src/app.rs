@@ -772,6 +772,9 @@ pub struct App {
         std::path::PathBuf,
         std::sync::Arc<HashMap<String, std::path::PathBuf>>,
     )>,
+    /// Counts the scans of the local files folder, so the Local files page
+    /// rebuilds its rows after one.
+    pub local_files_revision: u64,
     /// Requested shuffle mode, applied to every context until changed.
     shuffle_wanted: bool,
     /// The repeat mode saved by the last run, which the first local load
@@ -1442,6 +1445,7 @@ impl App {
             intent_track: None,
             played_row: None,
             local_files: None,
+            local_files_revision: 0,
             shuffle_wanted: session.shuffle_on,
             repeat_wanted: RepeatMode::from_api(&session.repeat),
             shuffle_set_at: None,
@@ -2922,6 +2926,7 @@ impl App {
                     // A scan of a folder since replaced says nothing now.
                     if self.settings.local_files_folder().as_ref() == Some(&folder) {
                         self.local_files = Some((folder, uris));
+                        self.local_files_revision = self.local_files_revision.wrapping_add(1);
                     }
                 }
                 Event::PlaylistCoverChosen {
@@ -3573,7 +3578,7 @@ impl App {
                     self.load_new_release_page(true);
                 }
             }
-            Page::Search => {}
+            Page::Search | Page::LocalFiles => {}
             Page::LikedSongs => {
                 if !self.liked_songs.cache_checked {
                     self.ensure_liked_songs();
@@ -3794,7 +3799,9 @@ impl App {
                 || match page {
                     Page::Playlist(id) => self.playlist_pages.contains_key(id),
                     Page::Album(id) => self.album_pages.contains_key(id),
-                    Page::LikedSongs | Page::TopSongs | Page::NewReleases => true,
+                    Page::LikedSongs | Page::TopSongs | Page::NewReleases | Page::LocalFiles => {
+                        true
+                    }
                     _ => false,
                 }
         });
@@ -6365,7 +6372,7 @@ impl App {
                     self.load_new_release_page(false);
                 }
             }
-            Page::Search => {}
+            Page::Search | Page::LocalFiles => {}
             Page::LikedSongs => self.ensure_liked_songs(),
             Page::Albums => {
                 if self.network_reachable && !self.library.albums.loaded_once {
@@ -7145,6 +7152,12 @@ impl App {
             }
             Page::LikedSongs => {
                 self.refresh_liked_songs();
+                return;
+            }
+            Page::LocalFiles => {
+                if let Some(folder) = self.settings.local_files_folder() {
+                    self.backend.send(Command::ScanLocalFiles(folder));
+                }
                 return;
             }
             Page::Albums => self.library.albums.reset(),
@@ -10615,13 +10628,14 @@ impl App {
             shuffle: shuffle.then_some(true),
             at: Instant::now(),
         });
-        self.queue_start_pending = Some(self.target());
+        let target = self.play_target_for(&request);
+        self.queue_start_pending = Some(target.clone());
         // Held for Soloist, never handed to the built-in player meanwhile.
         if self.soloist_waiting() {
             self.queued_play = Some(request);
             return;
         }
-        match self.target() {
+        match target {
             Target::Local if !self.local.connected => {
                 // Hold the request while the local engine reconnects.
                 self.queued_play = Some(request);
@@ -11958,6 +11972,89 @@ impl App {
                     .local_files
                     .as_ref()
                     .is_some_and(|(_, uris)| uris.contains_key(&local_file_key(uri))))
+    }
+
+    /// Where `request` plays. Soloist cannot play local files, so with
+    /// Soloist on, anything that holds a song from the local files folder
+    /// plays on the built-in player, which can, Spotify songs around it
+    /// included. Anything else goes back to Soloist once the built-in
+    /// player took over for local files.
+    pub(crate) fn play_target_for(&self, request: &PlayRequest) -> Target {
+        let target = self.target();
+        if !self.settings.soloist_enabled || !self.local_ready {
+            return target;
+        }
+        let local = self.request_holds_local_files(request);
+        match target {
+            Target::Remote(_) if local => Target::Local,
+            Target::Local if !local && !self.soloist_waiting() => {
+                Target::Remote(self.soloist_device_id.clone())
+            }
+            target => target,
+        }
+    }
+
+    /// Whether `request` plays a song the local files folder holds: one of
+    /// its listed songs, or a loaded row of the playlist it starts.
+    pub(crate) fn request_holds_local_files(&self, request: &PlayRequest) -> bool {
+        if request
+            .uris
+            .iter()
+            .any(|uri| self.local_file(uri).is_some())
+        {
+            return true;
+        }
+        let Some(id) = request
+            .context_uri
+            .as_deref()
+            .and_then(|context| context.strip_prefix("spotify:playlist:"))
+        else {
+            return false;
+        };
+        self.playlist_pages.get(id).is_some_and(|page| {
+            page.items
+                .items
+                .iter()
+                .chain(page.items.windows.values().flatten())
+                .filter(|row| row.is_local)
+                .filter_map(|row| row.item.as_ref().or(row.track.as_ref()))
+                .any(|item| self.local_file(item.uri()).is_some())
+        })
+    }
+
+    /// The songs in the local files folder, ordered by artist, album and
+    /// title, described by what their URIs say of them.
+    pub fn local_file_tracks(&self) -> Vec<Track> {
+        let Some((_, files)) = self.local_files.as_ref() else {
+            return Vec::new();
+        };
+        let mut tracks: Vec<Track> = files
+            .keys()
+            .filter_map(|uri| {
+                let id = librespot_core::SpotifyUri::from_uri(uri).ok()?;
+                match crate::session_reads::local_track(&id, uri.clone())? {
+                    PlayableItem::Track(track) => Some(track),
+                    _ => None,
+                }
+            })
+            .collect();
+        let key = |track: &Track| {
+            (
+                track
+                    .artists
+                    .first()
+                    .map(|artist| artist.name.to_lowercase())
+                    .unwrap_or_default(),
+                track
+                    .album
+                    .as_ref()
+                    .map(|album| album.name.to_lowercase())
+                    .unwrap_or_default(),
+                track.name.to_lowercase(),
+            )
+        };
+        tracks.sort_by_cached_key(key);
+        tracks
     }
 
     /// The file in the local files folder that `uri` plays from.
@@ -23744,6 +23841,138 @@ mod tests {
             assert_eq!(app.selected_device.is_some(), id == "speaker");
             assert_eq!(app.remote_poll_seq, seq + u64::from(id == "soloist"));
         }
+    }
+
+    /// The local files folder holds `uris`; Soloist is ready and playing.
+    fn soloist_with_local_files(uris: &[&str]) -> App {
+        let mut app = test_app("soloist-local-files");
+        app.settings.soloist_enabled = true;
+        app.soloist_status = crate::soloist::Status::Ready {
+            name: "ours".into(),
+            version: "1".into(),
+            expires: u64::MAX,
+        };
+        app.soloist_device_id = Some("soloist".into());
+        app.local_ready = true;
+        app.local_device_id = Some("builtin".into());
+        app.remote = Some(RemoteSnapshot {
+            state: PlaybackState {
+                is_playing: true,
+                device: Some(Device {
+                    id: Some("soloist".into()),
+                    ..Default::default()
+                }),
+                item: Some(PlayableItem::Track(Track {
+                    uri: "spotify:track:playing".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            received_at: Instant::now(),
+        });
+        let files: HashMap<String, std::path::PathBuf> = uris
+            .iter()
+            .map(|uri| {
+                (
+                    local_file_key(uri),
+                    std::path::PathBuf::from(format!("/music/{uri}.mp3")),
+                )
+            })
+            .collect();
+        app.local_files = Some(("/music".into(), std::sync::Arc::new(files)));
+        app
+    }
+
+    const LOCAL_SONG: &str = "spotify:local:Artist:Album:Song:200";
+
+    #[test]
+    fn with_soloist_a_list_holding_a_local_file_plays_on_the_built_in_player() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        let local = PlayRequest::tracks(vec!["spotify:track:a".into(), LOCAL_SONG.into()]);
+        assert_eq!(app.play_target_for(&local), Target::Local);
+        let spotify = PlayRequest::tracks(vec!["spotify:track:a".into()]);
+        assert_eq!(
+            app.play_target_for(&spotify),
+            Target::Remote(Some("soloist".into()))
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn with_soloist_a_local_file_the_folder_lacks_stays_on_soloist() {
+        let mut app = soloist_with_local_files(&[]);
+        let request = PlayRequest::tracks(vec![LOCAL_SONG.into()]);
+        assert_eq!(
+            app.play_target_for(&request),
+            Target::Remote(Some("soloist".into()))
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn with_soloist_a_playlist_with_a_local_row_plays_on_the_built_in_player() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        let mut items = PagedList::default();
+        let mut local = cached_playlist_row(LOCAL_SONG);
+        local.is_local = true;
+        items.restore_cached(vec![cached_playlist_row("spotify:track:a"), local], 2, None);
+        app.playlist_pages.insert(
+            "mixed".into(),
+            PlaylistPage {
+                items,
+                ..Default::default()
+            },
+        );
+        let mixed = PlayRequest::context("spotify:playlist:mixed");
+        assert_eq!(app.play_target_for(&mixed), Target::Local);
+        let other = PlayRequest::context("spotify:playlist:other");
+        assert_eq!(
+            app.play_target_for(&other),
+            Target::Remote(Some("soloist".into()))
+        );
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn after_local_files_the_next_spotify_play_returns_to_soloist() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        app.local.track = Some(crate::player::LocalTrack::default());
+        app.local.playback = crate::player::Playback::Playing;
+        assert_eq!(app.target(), Target::Local);
+        let spotify = PlayRequest::tracks(vec!["spotify:track:a".into()]);
+        assert_eq!(
+            app.play_target_for(&spotify),
+            Target::Remote(Some("soloist".into()))
+        );
+        let local = PlayRequest::tracks(vec![LOCAL_SONG.into()]);
+        assert_eq!(app.play_target_for(&local), Target::Local);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn without_soloist_the_target_is_unchanged() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        app.settings.soloist_enabled = false;
+        let local = PlayRequest::tracks(vec![LOCAL_SONG.into()]);
+        assert_eq!(app.play_target_for(&local), app.target());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn local_files_page_lists_the_folder_in_order_with_readable_names() {
+        let mut app = soloist_with_local_files(&[
+            "spotify:local:Zed:B:Last+Song:100",
+            "spotify:local:Abc:A:First%2BSong:90",
+        ]);
+        let tracks = app.local_file_tracks();
+        let names: Vec<_> = tracks.iter().map(|track| track.name.as_str()).collect();
+        assert_eq!(names, ["First+Song", "Last Song"]);
+        assert!(tracks.iter().all(|track| track.is_local));
+        assert_eq!(
+            Page::decode(&Page::LocalFiles.encode()),
+            Some(Page::LocalFiles)
+        );
+        app.backend.shutdown();
     }
 
     fn test_app(name: &str) -> App {

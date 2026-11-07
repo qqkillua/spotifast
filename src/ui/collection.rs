@@ -1773,6 +1773,85 @@ pub(crate) fn playlist_cached_table_items(
     (items, positions, duration_ms)
 }
 
+/// The songs in the local files folder. Spotify's own Local Files list
+/// cannot be played as a context, so they play as a list of songs, on the
+/// built-in player: it is the one that reads files from the folder.
+pub fn local_files(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette.clone();
+    theme::text(
+        ui,
+        gettext(app.locale, "Local files"),
+        theme::bold(30.0),
+        palette.text,
+    );
+    ui.add_space(4.0);
+    theme::text(
+        ui,
+        crate::ui::settings::local_files_detail(app),
+        theme::regular(13.5),
+        palette.secondary,
+    );
+    ui.add_space(18.0);
+    if app.settings.local_files_folder().is_none() {
+        if ui.button(gettext(app.locale, "Choose folder")).clicked() {
+            app.actions.push(Action::ChooseLocalFilesFolder);
+        }
+        return;
+    }
+    if app.local_files.is_none() {
+        widgets::skeleton_rows(ui, &palette, app.locale, 6);
+        return;
+    }
+    let generation = app.local_files_revision;
+    let names = app.user_names_revision;
+    let items = if let Some(items) =
+        table_items_hit(app, &Page::LocalFiles, generation, generation, names)
+    {
+        items
+    } else {
+        let rows = app
+            .local_file_tracks()
+            .into_iter()
+            .map(|track| (PlayableItem::Track(track), None, None))
+            .collect();
+        remember_table_items(app, Page::LocalFiles, generation, generation, names, rows)
+    };
+    let uris: Arc<[String]> = items
+        .iter()
+        .map(|(item, _, _)| item.uri().to_string())
+        .collect::<Vec<_>>()
+        .into();
+    if !uris.is_empty() && ui.button(gettext(app.locale, "Play")).clicked() {
+        app.actions.push(Action::PlayUris {
+            uris: uris.to_vec(),
+            index: 0,
+        });
+    }
+    ui.add_space(12.0);
+    table(
+        app,
+        ui,
+        Table {
+            items: &items,
+            row_offset: 0,
+            pagination: None,
+            context: RowContext::Uris(Arc::clone(&uris)),
+            show_album: true,
+            show_cover: true,
+            show_added: false,
+            show_added_by: false,
+            show_plays: false,
+            page: Page::LocalFiles,
+            loading: false,
+            error: None,
+            can_load_more: false,
+            filter: "",
+            items_revision: generation,
+            plays_shown_rows: false,
+        },
+    );
+}
+
 /// A complete, ranked view of the listener's current top tracks.
 pub fn top_songs(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;

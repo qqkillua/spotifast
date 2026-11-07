@@ -388,7 +388,7 @@ fn section(
 
 /// What the local files row says: the folder and how many songs it holds,
 /// or what a folder is for.
-fn local_files_detail(app: &App) -> String {
+pub(crate) fn local_files_detail(app: &App) -> String {
     let locale = app.locale;
     let Some(folder) = app.settings.local_files_folder() else {
         return gettext(

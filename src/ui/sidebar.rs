@@ -325,6 +325,32 @@ fn liked_entry(app: &App) -> Entry {
     }
 }
 
+/// The songs of the local files folder, shown once a scan found some.
+fn local_files_entry(app: &App) -> Option<Entry> {
+    let (_, files) = app.local_files.as_ref()?;
+    if files.is_empty() {
+        return None;
+    }
+    let count = app.locale.song_count(files.len() as u32);
+    Some(Entry {
+        image: None,
+        grid_image: None,
+        name: gettext(app.locale, "Local files").into_owned(),
+        subtitle: count.clone(),
+        grid_subtitle: count,
+        page: Page::LocalFiles,
+        uri: String::new(),
+        round: false,
+        liked: false,
+        owned: false,
+        editable: false,
+        playlist_index: None,
+        folder: None,
+        depth: 0,
+        added_at: None,
+    })
+}
+
 pub(crate) fn selected_sort(app: &App, shelf: Filter) -> LibrarySort {
     if let Some(sort) = app.settings.library_sort.get(&shelf).copied()
         && sort.supports(shelf)
@@ -721,6 +747,11 @@ fn playlist_rows(app: &App, sort: LibrarySort, needle: &str, entries: &mut Vec<E
     let liked = liked_entry(app);
     if needle.is_empty() || liked.name.to_lowercase().contains(needle) {
         entries.push(liked);
+    }
+    if let Some(local) = local_files_entry(app)
+        && (needle.is_empty() || local.name.to_lowercase().contains(needle))
+    {
+        entries.push(local);
     }
     let user_id = app.user_id().filter(|id| !id.is_empty());
     // Name keeps playlists inside their folders, as Spotify does, and sorts

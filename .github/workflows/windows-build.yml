@@ -1,0 +1,37 @@
+# Builds this fork's Windows executable on every push to its branch, the same
+# way the release workflow builds Spotifast, and keeps it as a downloadable
+# artifact of the run.
+name: Windows build
+
+on:
+  push:
+    branches: [soloist-local-files]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      # The repository pins its toolchain; add the target to the pinned one.
+      - run: rustup target add x86_64-pc-windows-msvc
+      # libprojectM reads OpenGL through GLEW; projectm-sys builds against
+      # vcpkg's static-CRT triplet, matching .cargo/config.toml.
+      - run: vcpkg install glew:x64-windows-static
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spotifast-windows-x64
+          path: |
+            target/x86_64-pc-windows-msvc/release/spotifast.exe
+            LICENSE
+          retention-days: 30
