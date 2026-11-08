@@ -3969,12 +3969,16 @@ impl App {
                 }
             }
         }
+        // A mixed list moves on to its next run itself, and Spotify has
+        // nothing to follow a local file with.
         if let Some(seed) = autoplay_seed(
             self.local_list.as_deref(),
             self.settings.autoplay,
             &self.local,
             &state,
-        ) {
+        )
+        .filter(|seed| self.segment_plan.is_none() && !seed.starts_with(LOCAL_URI_PREFIX))
+        {
             log::info!("the list ended; playing what Spotify follows {seed} with");
             self.local_list = None;
             self.backend.player(PlayerCommand::Load(LoadSpec {
