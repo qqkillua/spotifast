@@ -11282,30 +11282,33 @@ impl App {
             }
             Target::Remote(_) if !self.can_set_volume() => {}
             Target::Remote(_) if !settle && !self.previews_remote_volume() => {}
-            Target::Remote(device_id) => {
-                self.soloist_volume_preview = Some(Instant::now());
-                self.remote_volume_request += 1;
-                self.pending_remote_volume = Some(PendingRemoteVolume {
-                    percent,
-                    device_id: device_id.clone(),
-                    request: self.remote_volume_request,
-                    after_poll: None,
-                    written_at: None,
-                    mismatches: 0,
-                });
-                self.backend.api(ApiRequest::Remote {
-                    action: RemoteAction::Volume {
-                        request: self.remote_volume_request,
-                    },
-                    device_id,
-                    play: None,
-                    position_ms: 0,
-                    percent,
-                    flag: false,
-                    repeat: String::new(),
-                });
-            }
+            Target::Remote(device_id) => self.send_remote_volume(device_id, percent),
         }
+    }
+
+    /// Sets `device_id`'s volume through Spotify, or Soloist's local API.
+    fn send_remote_volume(&mut self, device_id: Option<String>, percent: u8) {
+        self.soloist_volume_preview = Some(Instant::now());
+        self.remote_volume_request += 1;
+        self.pending_remote_volume = Some(PendingRemoteVolume {
+            percent,
+            device_id: device_id.clone(),
+            request: self.remote_volume_request,
+            after_poll: None,
+            written_at: None,
+            mismatches: 0,
+        });
+        self.backend.api(ApiRequest::Remote {
+            action: RemoteAction::Volume {
+                request: self.remote_volume_request,
+            },
+            device_id,
+            play: None,
+            position_ms: 0,
+            percent,
+            flag: false,
+            repeat: String::new(),
+        });
     }
 
     /// Whether a volume drag may reach the device before the release. Our own
@@ -12098,6 +12101,7 @@ impl App {
     /// not always stop one when the other starts: what starts on one pauses
     /// the other, so two songs never play at once.
     fn silence_other_player(&mut self, target: &Target) {
+        self.carry_volume(target);
         match target {
             Target::Local => {
                 let soloist_playing = self.remote.as_ref().is_some_and(|remote| {
@@ -12121,6 +12125,53 @@ impl App {
                     self.backend.player(PlayerCommand::Toggle);
                     self.local.playback = crate::player::Playback::Paused;
                 }
+            }
+        }
+    }
+
+    /// Gives the player about to start the volume of the one playing until
+    /// now, so a local file after a Spotify song, or the other way round,
+    /// does not come louder or quieter because each player kept its own.
+    fn carry_volume(&mut self, target: &Target) {
+        if self.target() == *target || !self.can_set_volume() {
+            return;
+        }
+        let Some(percent) = self.now_playing().map(|now| now.volume_percent) else {
+            return;
+        };
+        match target {
+            Target::Local => {
+                let volume = percent_to_volume(percent);
+                if volume_to_percent(self.local.volume) == percent {
+                    return;
+                }
+                self.local.volume = volume;
+                self.pending_local_volume = Some((volume, Instant::now()));
+                if self.settings.volume != volume {
+                    self.settings.volume = volume;
+                    self.settings_dirty = true;
+                }
+                self.backend.player(PlayerCommand::Volume(volume));
+            }
+            Target::Remote(device_id) => {
+                let current = self
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.state.device.as_ref())
+                    .filter(|device| device.id == *device_id)
+                    .and_then(|device| device.volume_percent);
+                if current == Some(percent) {
+                    return;
+                }
+                if self.has_soloist_output_volume() {
+                    self.backend.soloist_output_volume.set(percent);
+                    self.session_dirty = true;
+                    return;
+                }
+                if self.backend.soloist_output_volume.remember(percent) {
+                    self.session_dirty = true;
+                }
+                self.send_remote_volume(device_id.clone(), percent);
             }
         }
     }
@@ -24497,6 +24548,40 @@ mod tests {
             &egui::Context::default(),
         );
         assert_eq!(app.local.playback, crate::player::Playback::Paused);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_local_file_after_soloist_plays_at_soloist_volume() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        app.local.volume = percent_to_volume(100);
+        app.remote = Some(RemoteSnapshot {
+            state: PlaybackState {
+                is_playing: true,
+                progress_ms: Some(1_000),
+                device: Some(Device {
+                    id: Some("soloist".into()),
+                    volume_percent: Some(40),
+                    ..Default::default()
+                }),
+                item: Some(PlayableItem::Track(Track {
+                    uri: "spotify:track:a".into(),
+                    duration_ms: 100_000,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            received_at: Instant::now(),
+        });
+        assert!(matches!(app.target(), Target::Remote(_)));
+        app.apply(
+            Action::PlayUris {
+                uris: vec![LOCAL_SONG.into()],
+                index: 0,
+            },
+            &egui::Context::default(),
+        );
+        assert_eq!(volume_to_percent(app.local.volume), 40);
         app.backend.shutdown();
     }
 
