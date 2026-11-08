@@ -424,6 +424,11 @@ impl ConnectState {
         }
     }
 
+    /// How long this device has been active.
+    pub(crate) fn active_for(&self) -> Option<std::time::Duration> {
+        self.active_since?.elapsed().ok()
+    }
+
     pub fn set_active(&mut self, value: bool) {
         if value {
             if self.request.is_active {

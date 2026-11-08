@@ -1,9 +1,10 @@
 # librespot-connect from crmne/librespot at
 # 3ba977f1f918582edce566cfc16617f8eccdfb1e, with one change in
-# src/spirc.rs: a Connect update naming another device as active does not
-# stop a local file while it plays. Spotify refuses the state of a device
-# playing a local file, so the cluster keeps naming the device that played
-# before (Soloist), and its next update stopped the local file seconds in.
+# src/spirc.rs (and a helper in src/state.rs): a Connect update naming
+# another device as active stops a local file here only when that device
+# plays. Spotify refuses the state of a device playing a local file, so the
+# cluster keeps naming the device that played before (Soloist), and its next
+# update, even while Soloist rested, stopped the local file seconds in.
 [package]
 name = "librespot-connect"
 version = "0.8.0"

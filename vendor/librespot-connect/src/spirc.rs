@@ -1532,11 +1532,16 @@ impl SpircTask {
             }
 
             // Spotify refuses the state of a device playing a local file, so
-            // the cluster still names the device that played before; that
-            // is no reason to stop the local file playing here.
+            // the cluster still names the device that played before. That
+            // device only takes over when it plays; while it rests, a local
+            // file here, or one about to load, keeps playing.
+            let other_plays = cluster
+                .player_state
+                .as_ref()
+                .is_some_and(|state| state.is_playing && !state.is_paused);
             let became_inactive = self.connect_state.is_active()
                 && cluster.active_device_id != self.session.device_id()
-                && !self.playing_local_file();
+                && (other_plays || !self.holding_local_file());
             if became_inactive {
                 info!("device became inactive");
                 self.handle_disconnect().await?;
@@ -1559,14 +1564,20 @@ impl SpircTask {
         Ok(())
     }
 
-    /// Whether a local file plays here or is about to.
-    fn playing_local_file(&self) -> bool {
-        matches!(
-            self.play_status,
-            SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. }
-        ) && self
+    /// Whether a local file plays here, or this device was activated a
+    /// moment ago and its load has not arrived yet.
+    fn holding_local_file(&self) -> bool {
+        let just_activated = self
             .connect_state
-            .current_track(|track| track.uri.starts_with("spotify:local:"))
+            .active_for()
+            .is_some_and(|active| active < Duration::from_secs(5));
+        just_activated
+            || matches!(
+                self.play_status,
+                SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. }
+            ) && self
+                .connect_state
+                .current_track(|track| track.uri.starts_with("spotify:local:"))
     }
 
     async fn handle_connect_state_request(

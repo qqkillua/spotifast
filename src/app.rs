@@ -242,6 +242,8 @@ pub(crate) struct SegmentPlan {
     /// from the moment before it starts.
     pub started: bool,
     pub started_at: Instant,
+    /// When the plan last asked for Soloist's state out of turn.
+    pub polled_at: Option<Instant>,
 }
 
 /// Songs in a row that one player plays: local files on the built-in
@@ -254,6 +256,10 @@ pub(crate) struct Segment {
 
 /// How long a run may take to start before the plan gives up on it.
 const SEGMENT_START_GRACE: Duration = Duration::from_secs(20);
+/// How often a run on Soloist may ask for its state out of turn. Each read
+/// is a new connection to Soloist, and reading on every frame used up the
+/// computer's free ports, so Soloist stopped taking any command.
+const SEGMENT_POLL_SPACING: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -12238,6 +12244,7 @@ impl App {
             index: 0,
             started: false,
             started_at: Instant::now(),
+            polled_at: None,
         })
     }
 
@@ -12294,6 +12301,22 @@ impl App {
         ))
     }
 
+    /// Asks for Soloist's state soon, at most once every
+    /// `SEGMENT_POLL_SPACING`.
+    fn poll_segment_soon(&mut self) {
+        let Some(plan) = self.segment_plan.as_mut() else {
+            return;
+        };
+        if plan
+            .polled_at
+            .is_some_and(|at| at.elapsed() < SEGMENT_POLL_SPACING)
+        {
+            return;
+        }
+        plan.polled_at = Some(Instant::now());
+        self.poll_remote_soon();
+    }
+
     /// Moves a mixed list on to its next run when the current one ends.
     fn advance_segments(&mut self) {
         let Some(plan) = self.segment_plan.as_ref() else {
@@ -12302,7 +12325,7 @@ impl App {
         let segment = plan.segments[plan.index].clone();
         let Some((uri, playing, ended)) = self.segment_player_state(segment.local) else {
             if !segment.local {
-                self.poll_remote_soon();
+                self.poll_segment_soon();
             }
             return;
         };
@@ -12323,7 +12346,7 @@ impl App {
         // Moved past the run (an autoplayed song), or stopped at its end.
         if !(!inside && !uri.is_empty() || (ended && (last || uri.is_empty()))) {
             if !segment.local && last {
-                self.poll_remote_soon();
+                self.poll_segment_soon();
             }
             return;
         }
@@ -24386,6 +24409,37 @@ mod tests {
         });
         app.advance_segments();
         assert_eq!(app.segment_plan, None);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_run_on_soloist_reads_its_state_at_most_every_two_seconds() {
+        let mut app = soloist_with_local_files(&[LOCAL_SONG]);
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::PlayUris {
+                uris: vec!["spotify:track:b".into(), LOCAL_SONG.into()],
+                index: 0,
+            },
+            &ctx,
+        );
+        assert!(!app.segment_plan.as_ref().unwrap().segments[0].local);
+        // Soloist says nothing yet: frames come many times a second.
+        app.remote = None;
+        app.advance_segments();
+        let first = app.remote_polled_at;
+        app.remote_polled_at = Instant::now();
+        for _ in 0..50 {
+            app.advance_segments();
+        }
+        assert!(
+            app.remote_polled_at.elapsed() < Duration::from_millis(500),
+            "no out-of-turn read within two seconds of the last"
+        );
+        assert!(
+            first.elapsed() > Duration::from_secs(20),
+            "the first frame asked for one"
+        );
         app.backend.shutdown();
     }
 
