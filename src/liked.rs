@@ -105,6 +105,11 @@ impl LikedSongs {
             && (0..FRESH_SECONDS).contains(&now.saturating_sub(self.refreshed_at))
     }
 
+    /// Whether Spotify was asked for Liked Songs in the last `seconds`.
+    pub fn checked_within(&self, now: i64, seconds: i64) -> bool {
+        self.server.loaded_once && (0..seconds).contains(&now.saturating_sub(self.refreshed_at))
+    }
+
     pub fn refreshing(&self) -> bool {
         self.refresh.is_some()
     }

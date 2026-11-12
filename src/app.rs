@@ -254,6 +254,10 @@ pub(crate) struct Segment {
     pub uris: Vec<String>,
 }
 
+/// How old Liked Songs may be when its page opens before Spotify is asked
+/// again, in seconds, and how often it is asked while the page stays open.
+const LIKED_OPEN_FRESH: i64 = 20;
+const LIKED_OPEN_POLL: Duration = Duration::from_secs(120);
 /// How long a run may take to start before the plan gives up on it.
 const SEGMENT_START_GRACE: Duration = Duration::from_secs(20);
 /// How often a run on Soloist may ask for its state out of turn. Each read
@@ -4699,6 +4703,11 @@ impl App {
                     _ => self.refresh_friends(),
                 }
             }
+            // A song liked on a phone shows up while Liked Songs is open,
+            // not only the next time the app starts.
+            if *self.page() == Page::LikedSongs && self.liked_recheck_at.is_none() {
+                self.liked_recheck_at = Some(Instant::now() + LIKED_OPEN_POLL);
+            }
             if let Some(due) = self.liked_recheck_at {
                 if Instant::now() >= due && !self.liked_songs.refreshing() {
                     self.liked_recheck_at = None;
@@ -6434,7 +6443,21 @@ impl App {
                 }
             }
             Page::Search | Page::LocalFiles => {}
-            Page::LikedSongs => self.ensure_liked_songs(),
+            Page::LikedSongs => {
+                self.ensure_liked_songs();
+                // Opening the page asks again sooner than the cache would,
+                // for songs liked elsewhere a moment ago.
+                if self.liked_songs.cache_checked
+                    && !self.liked_songs.refreshing()
+                    && !self
+                        .liked_songs
+                        .checked_within(jiff::Timestamp::now().as_second(), LIKED_OPEN_FRESH)
+                    && self.library.liked.error.is_none()
+                    && self.network_reachable
+                {
+                    self.refresh_liked_songs();
+                }
+            }
             Page::Albums => {
                 if self.network_reachable && !self.library.albums.loaded_once {
                     self.load_more(Page::Albums);
